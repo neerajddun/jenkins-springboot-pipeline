@@ -5,7 +5,7 @@ metadata:
   name: app-dep-alertconfig
   namespace: myapp
   labels:
-    release: monitoring # same label rule you just learned — required to be picked up
+    release: monitoring # must match the alertmanagerConfigSelector on your Alertmanager
 spec:
   route:
     receiver: slack-notifications
@@ -20,4 +20,14 @@ spec:
             name: slack-webhook-secret
             key: url
           channel: "#alerts"
+          sendResolved: true
+      emailConfigs:
+        - to: neerajbijalwan96@gmail.com
+          from: neerajbijalwan96@gmail.com
+          smarthost: smtp.gmail.com:587
+          authUsername: neerajbijalwan96@gmail.com
+          authPassword:
+            name: smtp-secret
+            key: password
+          requireTLS: true
           sendResolved: true
