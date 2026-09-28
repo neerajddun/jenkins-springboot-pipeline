@@ -1,104 +1,189 @@
 pipeline {
-    agent any
 
-    tools {
-        jdk   'jdk 21'
-        maven 'Maven 3.9.9'
+    agent any 
+
+    tools { 
+
+        maven 'Maven 3.8.7'
+        jdk 'jdk 21'
     }
 
-    environment {
-        IMAGE = "neeraj91/${JOB_NAME}:v1.${BUILD_ID}"
+     environment {
+
+        EKS_CLUSTER = "test-cluster" 
+        ECR_REGISTRY = "883999921903.dkr.ecr.ap-southeast-1.amazonaws.com"
+        APP_NAME = "my-repo"
+        IMAGE_TAG = "v1.${BUILD_NUMBER}"
     }
 
     stages {
 
-        stage('Checkout') {
-            steps {
-              
-               checkout scm
-            }
-        }
-
-        stage('Build & Test') {
-            steps {
-                sh 'mvn clean install -DskipTests -B'
-                
-            }
-        }
-
-        stage('Nexus Deploy') {
+        stage ('Checkout') {
 
             steps {
 
-                sh 'mvn deploy -DskipTests'
+                checkout scm 
             }
         }
 
-        // Merged: Docker build + tag into one stage
-        stage('Docker Build & Tag') {
+        stage ('Unit Test') {
+
             steps {
-                sh "docker build -t ${IMAGE} ."
+
+                sh 'mvn test'
             }
         }
 
-        // Merged: Docker login + push using credentials (no hardcoded password)
-        stage('Docker Push') {
+        stage ('Integration Test') {
+
             steps {
-                withCredentials([usernamePassword(
-                    credentialsId: 'dockerhub-credentials',
-                    usernameVariable: 'DOCKER_USER',
-                    passwordVariable: 'DOCKER_PASS'
-                )]) {
-                    sh 'echo $DOCKER_PASS | docker login -u $DOCKER_USER --password-stdin'
-                    sh "docker push ${IMAGE}"
-                }
+
+                sh 'mvn clean verify -DskipTests -B'
             }
         }
 
-     /*   stage('Terraform') {
-          steps  {
-            dir('demo/terraform') {
-               sh 'terraform init '
-               sh 'terraform plan ' 
-               sh  'terraform apply --auto - approve' 
-            }
-        }
-        }
+        stage ('Build') {
 
-        stage('push artifact to s3') {
             steps {
-                dir('demo') {
-                    sh 'zip -r app.zip .'
-                    sh 'aws s3 cp app.zip s3://neeraj-react-artifacts-1234/'
-                }
+
+                sh 'mvn clean install -DskipTests'
             }
-
         }
-        */
 
-        stage('Deploy') {
+        stage ('Deploy to Nexus') {
+
+            steps {
+
+                sh 'mvn deploy -DskipTests -B'
+            }
+        }
+
+        stage('SonarQube Scan') {
             
             steps {
-                withCredentials([aws(accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'aws-creds', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
 
-                  sh '''
+                withSonarQubeEnv('SonarQube') {
+                   
+                   sh 'mvn sonar:sonar'
 
-                    aws eks update-kubeconfig --name test-cluster --region ap-southeast-1
-                    kubectl apply -f deployment.yaml
-                    kubectl apply -f service.yaml
+                }   
+            }
+        }
 
-                 '''
+        stage('Quality Gate') {
+            steps {
+                sleep(time: 15, unit: 'SECONDS')
+
+                timeout(time: 5, unit: 'MINUTES') {
+                    waitForQualityGate abortPipeline: true
                 }
             }
         }
-    
+
+        stage ('Docker Image') {
+
+            steps {
+
+                sh "docker build -t ${APP_NAME}:${IMAGE_TAG} ."
+                sh "docker tag ${APP_NAME}:${IMAGE_TAG} ${ECR_REGISTRY}/${APP_NAME}:${IMAGE_TAG}"
+                sh "docker tag ${APP_NAME}:${IMAGE_TAG} ${ECR_REGISTRY}/${APP_NAME}:latest"
+            }
+
+        }
+        
+        stage('Dependency Check') {
+            steps {
+              
+               sh 'mkdir -p owasp-report'
+               withCredentials([string(credentialsId: 'nvd-api-key', variable: 'NVD_API_KEY')]) {
+               
+                dependencyCheck additionalArguments: "--nvdApiKey ${NVD_API_KEY} --scan . --format ALL --out owasp-report", odcInstallation: 'OWASP-Dependency-Check'
+               }
+                 
+                dependencyCheckPublisher(
+                pattern: 'owasp-report/dependency-check-report.xml'
+                )
+            }
+        }
+
+        stage('Trivy Image Scan') {
+           steps {
+              catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE') {
+                 sh """
+                    trivy image \
+                      --exit-code 1 \
+                      --severity CRITICAL \
+                      --no-progress \
+                      ${APP_NAME}:${IMAGE_TAG}
+                 """
+              }
+           }
+
+        post {
+            always {
+                sh """
+                    trivy image \
+                      --exit-code 0 \
+                      --severity HIGH,CRITICAL \
+                      --format json \
+                      --output trivy-report.json \
+                      ${APP_NAME}:${IMAGE_TAG}
+                """
+
+                  archiveArtifacts(
+                      artifacts: 'trivy-report.json',
+                      fingerprint: true
+                  )
+                }
+            }
+        }
+
+        stage ('Docker push') {
+
+            steps {
+
+                script {
+                     
+                    withCredentials([aws(accessKeyVariable: 'AWS_ACCESS_KEY_ID', credentialsId: 'aws-creds', secretKeyVariable: 'AWS_SECRET_ACCESS_KEY')]) {
+                     
+                     sh """
+
+                    aws ecr get-login-password --region ap-southeast-1 | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+                    docker push ${ECR_REGISTRY}/${APP_NAME}:${IMAGE_TAG}   
+                    docker push ${ECR_REGISTRY}/${APP_NAME}:latest
+                     
+                     """
+
+                    }
+
+                }
+            }
+        }
+
+        stage('Update GitOps manifest') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'github-creds', passwordVariable: 'GIT_TOKEN', usernameVariable: 'GIT_USER')]) {
+                  
+                   sh '''
+                     git config user.name "jenkins-ci"
+                     git config user.email "jenkins@ci.local"
+                     git pull  https://$GIT_USER:$GIT_TOKEN@github.com/neerajddun/jenkins-end-to-end-pipeline.git master
+                     sed -i "s|image: .*|image: $ECR_REGISTRY/$APP_NAME:$IMAGE_TAG|" k8s/deployment.yaml
+                     git add k8s/deployment.yaml
+                     git commit -m "Update image to $IMAGE_TAG [skip ci]"
+                     git push https://$GIT_USER:$GIT_TOKEN@github.com/neerajddun/jenkins-end-to-end-pipeline.git HEAD:master
+                   '''
+                }
+            }
+        } 
     }
 
     post {
+       
+       always {
 
-         always 
-     {
-            cleanWs()
+        cleanWs()
         }
     }
+
 }
